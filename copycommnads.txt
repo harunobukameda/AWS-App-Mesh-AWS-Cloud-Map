@@ -1,0 +1,905 @@
+1.
+rm -vf ${HOME}/.aws/credentials
+
+2.
+export ACCOUNT_ID=$(aws sts get-caller-identity --output text --query Account)
+export AWS_REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | \
+  grep region | cut -d\" -f4)
+
+echo "export ACCOUNT_ID=${ACCOUNT_ID}" >> ~/.bash_profile
+echo "export AWS_REGION=${AWS_REGION}" >> ~/.bash_profile
+aws configure set default.region ${AWS_REGION}
+aws configure get default.region
+
+3.
+aws sts get-caller-identity
+
+4.
+# create a folder for the scripts
+mkdir ~/environment/scripts
+
+# tools script
+cat > ~/environment/scripts/install-tools <<-"EOF"
+
+#!/bin/bash -ex
+
+sudo yum install -y jq gettext bash-completion
+
+sudo curl --silent --location "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm" -o "session-manager-plugin.rpm"
+sudo yum install -y session-manager-plugin.rpm
+
+sudo curl --silent --location -o /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/v1.16.8/bin/linux/amd64/kubectl
+sudo chmod +x /usr/local/bin/kubectl
+echo 'source <(kubectl completion bash)' >>~/.bashrc
+source ~/.bashrc
+
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/download/latest_release/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv -v /tmp/eksctl /usr/local/bin
+
+if ! [ -x "$(command -v jq)" ] || ! [ -x "$(command -v envsubst)" ] || ! [ -x "$(command -v kubectl)" ] || ! [ -x "$(command -v eksctl)" ] || ! [ -x "$(command -v ssm-cli)" ]; then
+  echo 'ERROR: tools not installed.' >&2
+  exit 1
+fi
+
+pip install awscli --upgrade --user
+
+EOF
+
+chmod +x ~/environment/scripts/install-tools
+
+5.
+~/environment/scripts/install-tools
+
+6.
+# clone the github repositories
+cd ~/environment
+git clone https://github.com/brentley/ecsdemo-frontend.git
+git clone https://github.com/brentley/ecsdemo-nodejs.git
+git clone https://github.com/brentley/ecsdemo-crystal.git
+
+7.
+cd ~/environment
+curl -s https://raw.githubusercontent.com/brentley/appmeshworkshop/master/templates/appmesh-baseline.yml -o appmesh-baseline.yml
+
+8.
+# Define environment variable
+IAM_ROLE=$(curl -s 169.254.169.254/latest/meta-data/iam/info | \
+  jq -r '.InstanceProfileArn' | cut -d'/' -f2)
+
+#Check if the template is already deployed. If not, deploy it
+CFN_TEMPLATE=$(aws cloudformation list-stacks | jq -c '.StackSummaries[].StackName | select( . == "appmesh-workshop" )')
+
+if [ -z "$CFN_TEMPLATE" ]
+then
+  echo "Deploying Cloudformation Template"
+  aws cloudformation deploy \
+    --template-file appmesh-baseline.yml \
+    --stack-name appmesh-workshop \
+    --capabilities CAPABILITY_IAM \
+    --parameter-overrides Cloud9IAMRole=$IAM_ROLE
+else
+  echo "Template already deployed. Go ahead to the next chapter."
+fi
+
+9.
+# Retrieve private key
+aws ssm get-parameter \
+  --name /appmeshworkshop/keypair/id_rsa \
+  --with-decryption | jq .Parameter.Value --raw-output > ~/.ssh/id_rsa
+
+# Set appropriate permission on private key
+chmod 600 ~/.ssh/id_rsa
+
+# Store public key separately from private key
+ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
+
+10.
+
+# bootstrap script
+cat > ~/environment/scripts/bootstrap <<-"EOF"
+
+#!/bin/bash -ex
+
+echo 'Fetching CloudFormation outputs'
+~/environment/scripts/fetch-outputs
+echo 'Building Docker Containers'
+~/environment/scripts/build-containers
+echo 'Creating the ECS Services'
+~/environment/scripts/create-ecs-service
+echo 'Creating the EKS Cluster'
+~/environment/scripts/build-eks
+
+EOF
+
+# fetch-outputs script
+cat > ~/environment/scripts/fetch-outputs <<-"EOF"
+
+#!/bin/bash -ex
+
+STACK_NAME=appmesh-workshop
+aws cloudformation describe-stacks \
+  --stack-name "$STACK_NAME" | \
+jq -r '[.Stacks[0].Outputs[] | 
+    {key: .OutputKey, value: .OutputValue}] | from_entries' > cfn-output.json
+
+EOF
+
+# Create EKS configuration file
+cat > ~/environment/scripts/eks-configuration <<-"EOF"
+
+#!/bin/bash -ex
+
+STACK_NAME=appmesh-workshop
+PRIVSUB1_ID=$(jq < cfn-output.json -r '.PrivateSubnetOne')
+PRIVSUB1_AZ=$(aws ec2 describe-subnets --subnet-ids $PRIVSUB1_ID | jq -r '.Subnets[].AvailabilityZone')
+PRIVSUB2_ID=$(jq < cfn-output.json -r '.PrivateSubnetTwo')
+PRIVSUB2_AZ=$(aws ec2 describe-subnets --subnet-ids $PRIVSUB2_ID | jq -r '.Subnets[].AvailabilityZone')
+PRIVSUB3_ID=$(jq < cfn-output.json -r '.PrivateSubnetThree')
+PRIVSUB3_AZ=$(aws ec2 describe-subnets --subnet-ids $PRIVSUB3_ID | jq -r '.Subnets[].AvailabilityZone')
+AWS_REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | grep region | cut -d\" -f4)
+
+cat > /tmp/eks-configuration.yml <<-EKS_CONF
+  apiVersion: eksctl.io/v1alpha5
+  kind: ClusterConfig
+  metadata:
+    name: $STACK_NAME
+    region: $AWS_REGION
+  vpc:
+    subnets:
+      private:
+        $PRIVSUB1_AZ: { id: $PRIVSUB1_ID }
+        $PRIVSUB2_AZ: { id: $PRIVSUB2_ID }
+        $PRIVSUB3_AZ: { id: $PRIVSUB3_ID }
+  nodeGroups:
+    - name: appmesh-workshop-ng
+      labels: { role: workers }
+      instanceType: m5.large
+      desiredCapacity: 3
+      ssh: 
+        allow: false
+      privateNetworking: true
+      iam:
+        withAddonPolicies:
+          imageBuilder: true
+          albIngress: true
+          autoScaler: true
+          appMesh: true
+          xRay: true
+          cloudWatch: true
+          externalDNS: true
+EKS_CONF
+
+EOF
+
+# Create the EKS building script
+cat > ~/environment/scripts/build-eks <<-"EOF"
+
+#!/bin/bash -ex
+
+EKS_CLUSTER_NAME=$(jq < cfn-output.json -r '.EKSClusterName')
+
+if [ -z "$EKS_CLUSTER_NAME" ] || [ "$EKS_CLUSTER_NAME" == null ]
+then
+  
+  if ! aws sts get-caller-identity --query Arn | \
+    grep -q 'assumed-role/AppMesh-Workshop-Admin/i-'
+  then
+    echo "Your role is not set correctly for this instance"
+    exit 1
+  fi
+
+  sh -c ~/environment/scripts/eks-configuration
+  eksctl create cluster -f /tmp/eks-configuration.yml
+else
+
+  NODES_IAM_ROLE=$(jq < cfn-output.json -r '.NodeInstanceRole')
+
+  aws eks --region $AWS_REGION update-kubeconfig --name $EKS_CLUSTER_NAME
+  cat > /tmp/aws-auth-cm.yml <<-EKS_AUTH
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: aws-auth
+      namespace: kube-system
+    data:
+      mapRoles: |
+        - rolearn: $NODES_IAM_ROLE 
+          username: system:node:{{EC2PrivateDNSName}}
+          groups:
+            - system:bootstrappers
+            - system:nodes
+EKS_AUTH
+  kubectl apply -f /tmp/aws-auth-cm.yml
+fi
+
+EOF
+
+# build-containers script
+cat > ~/environment/scripts/build-containers <<-"EOF"
+
+#!/bin/bash -ex
+
+CRYSTAL_ECR_REPO=$(jq < cfn-output.json -r '.CrystalEcrRepo')
+NODEJS_ECR_REPO=$(jq < cfn-output.json -r '.NodeJSEcrRepo')
+
+$(aws ecr get-login --no-include-email)
+
+docker build -t crystal-service ecsdemo-crystal
+docker tag crystal-service:latest $CRYSTAL_ECR_REPO:vanilla
+docker push $CRYSTAL_ECR_REPO:vanilla
+
+docker build -t nodejs-service ecsdemo-nodejs
+docker tag nodejs-service:latest $NODEJS_ECR_REPO:latest
+docker push $NODEJS_ECR_REPO:latest
+
+EOF
+
+# create-ecs-service script
+cat > ~/environment/scripts/create-ecs-service <<-"EOF"
+
+#!/bin/bash -ex
+
+CLUSTER=$(jq < cfn-output.json -r '.EcsClusterName')
+TASK_DEF=$(jq < cfn-output.json -r '.CrystalTaskDefinition')
+TARGET_GROUP=$(jq < cfn-output.json -r '.CrystalTargetGroupArn')
+SUBNET_ONE=$(jq < cfn-output.json -r '.PrivateSubnetOne')
+SUBNET_TWO=$(jq < cfn-output.json -r '.PrivateSubnetTwo')
+SUBNET_THREE=$(jq < cfn-output.json -r '.PrivateSubnetThree')
+SECURITY_GROUP=$(jq < cfn-output.json -r '.ContainerSecurityGroup')
+
+aws ecs create-service \
+  --cluster $CLUSTER \
+  --service-name crystal-service-lb \
+  --task-definition $TASK_DEF \
+  --load-balancer targetGroupArn=$TARGET_GROUP,containerName=crystal-service,containerPort=3000 \
+  --desired-count 3 \
+  --launch-type FARGATE \
+  --network-configuration \
+      "awsvpcConfiguration={
+        subnets=[$SUBNET_ONE,$SUBNET_TWO,$SUBNET_THREE],
+        securityGroups=[$SECURITY_GROUP],
+        assignPublicIp=DISABLED}"
+
+EOF
+
+chmod +x ~/environment/scripts/*
+
+11.
+~/environment/scripts/bootstrap
+
+12.
+echo "http://$(jq -r '.ExternalLoadBalancerDNS' cfn-output.json)/"
+
+13.
+kubectl create namespace appmesh-workshop-ns
+
+# Create directory for eks scripts
+mkdir ~/environment/eks-scripts
+
+# Create deployment yaml file
+cat <<-EOF > ~/environment/eks-scripts/nodejs-deployment.yml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodejs-app
+  labels:
+    app: nodejs-app
+  namespace: appmesh-workshop-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nodejs-app
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nodejs-app
+    spec:
+      containers:
+      - image: brentley/ecsdemo-nodejs:latest
+        imagePullPolicy: Always
+        name: nodejs-app
+        ports:
+        - containerPort: 3000
+          protocol: TCP
+
+EOF
+# Deploy NodeJS App to EKS
+kubectl apply -f ~/environment/eks-scripts/nodejs-deployment.yml
+
+14.
+# Create service yaml file
+cat <<-EOF > ~/environment/eks-scripts/nodejs-service.yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-app-service
+  namespace: appmesh-workshop-ns
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+
+spec:
+  selector:
+    app: nodejs-app
+  ports:
+   -  protocol: TCP
+      port: 3000
+      targetPort: 3000
+  type: LoadBalancer
+EOF
+
+# Create service in EKS Cluster
+kubectl apply -f ~/environment/eks-scripts/nodejs-service.yml
+
+15.
+# Define variables
+HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
+  --dns-name appmeshworkshop.hosted.local \
+  --max-items 1 | \
+  jq -r ' .HostedZones | first | .Id' | cut -d '/' -f3);
+NODEJS_LB_URL=$(kubectl get service nodejs-app-service -n appmesh-workshop-ns -o json | \
+  jq -r   '.status.loadBalancer.ingress[].hostname')
+NODEJS_LB_HOSTED_ZONE=$(aws elb describe-load-balancers | \
+  jq -r --arg lb "$NODEJS_LB_URL" '.LoadBalancerDescriptions[]|select(.DNSName==$lb).CanonicalHostedZoneNameID')
+# Create Route53 batch file
+cat <<-EOF > /tmp/add_nodejs_recordset.json
+{
+    "Comment": "CREATE nodejs.appmeshworkshop.hosted.local",
+    "Changes": [
+        {
+            "Action": "CREATE",
+            "ResourceRecordSet": {
+                "AliasTarget": {
+                    "HostedZoneId": "$NODEJS_LB_HOSTED_ZONE",
+                    "EvaluateTargetHealth": false,
+                    "DNSName": "$NODEJS_LB_URL."
+                },
+            "Type": "A",
+            "Name": "nodejs.appmeshworkshop.hosted.local."
+            }
+        }
+    ]
+}
+EOF
+
+# Change route53 record set
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch file:///tmp/add_nodejs_recordset.json
+
+16.
+# Create mesh #
+aws appmesh create-mesh \
+  --mesh-name appmesh-workshop \
+  --spec egressFilter={type=DROP_ALL}
+
+17.
+# Define variables #
+INT_LOAD_BALANCER=$(jq < cfn-output.json -r '.InternalLoadBalancerDNS');
+SPEC=$(cat <<-EOF
+  { 
+    "serviceDiscovery": {
+      "dns": { 
+        "hostname": "$INT_LOAD_BALANCER"
+      }
+    },
+    "logging": {
+      "accessLog": {
+        "file": {
+          "path": "/dev/stdout"
+        }
+      }
+    },      
+    "listeners": [
+      {
+        "healthCheck": {
+          "healthyThreshold": 3,
+          "intervalMillis": 10000,
+          "path": "/health",
+          "port": 3000,
+          "protocol": "http",
+          "timeoutMillis": 5000,
+          "unhealthyThreshold": 3
+        },
+        "portMapping": { "port": 3000, "protocol": "http" }
+      }
+    ]
+  }
+EOF
+); \
+# Create app mesh virual node #
+aws appmesh create-virtual-node \
+  --mesh-name appmesh-workshop \
+  --virtual-node-name crystal-lb-vanilla \
+  --spec "$SPEC"
+
+18.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "provider": {
+      "virtualNode": { 
+        "virtualNodeName": "crystal-lb-vanilla"
+      }
+    }
+  }
+EOF
+); \
+# Create app mesh virtual service #
+aws appmesh create-virtual-service \
+  --mesh-name appmesh-workshop \
+  --virtual-service-name crystal.appmeshworkshop.hosted.local \
+  --spec "$SPEC"
+
+19.
+# Define variables #
+ENVOY_REGISTRY="840364872350.dkr.ecr.$AWS_REGION.amazonaws.com";
+TASK_DEF_ARN=$(jq < cfn-output.json -r '.CrystalTaskDefinition');
+TASK_DEF_OLD=$(aws ecs describe-task-definition --task-definition $TASK_DEF_ARN);
+TASK_DEF_NEW=$(echo $TASK_DEF_OLD \
+  | jq ' .taskDefinition' \
+  | jq --arg ENVOY_REGISTRY $ENVOY_REGISTRY ' .containerDefinitions += 
+        [
+          {
+            "environment": [
+              {
+                "name": "APPMESH_VIRTUAL_NODE_NAME",
+                "value": "mesh/appmesh-workshop/virtualNode/crystal-lb-vanilla"
+              }
+            ],
+            "image": ($ENVOY_REGISTRY + "/aws-appmesh-envoy:v1.11.2.0-prod"),
+            "healthCheck": {
+              "retries": 3,
+              "command": [
+                "CMD-SHELL",
+                "curl -s http://localhost:9901/server_info | grep state | grep -q LIVE"
+              ],
+              "timeout": 2,
+              "interval": 5,
+              "startPeriod": 10
+            },
+            "essential": true,
+            "user": "1337",
+            "name": "envoy"
+          }
+        ]' \
+  | jq ' .containerDefinitions[0] +=
+        { 
+          "dependsOn": [ 
+            { 
+              "containerName": "envoy",
+              "condition": "HEALTHY" 
+            }
+          ] 
+        }' \
+  | jq ' . += 
+        { 
+          "proxyConfiguration": {
+            "type": "APPMESH",
+            "containerName": "envoy",
+            "properties": [
+              { "name": "IgnoredUID", "value": "1337"},
+              { "name": "ProxyIngressPort", "value": "15000"},
+              { "name": "ProxyEgressPort", "value": "15001"},
+              { "name": "AppPorts", "value": "3000"},
+              { "name": "EgressIgnoredIPs", "value": "169.254.170.2,169.254.169.254"}
+            ]
+          }
+        }' \
+  | jq ' del(.status, .compatibilities, .taskDefinitionArn, .requiresAttributes, .revision, .registeredBy, .registeredAt) '
+); \
+
+TASK_DEF_FAMILY=$(echo $TASK_DEF_ARN | cut -d"/" -f2 | cut -d":" -f1);
+echo $TASK_DEF_NEW > /tmp/$TASK_DEF_FAMILY.json && 
+# Register ecs task definition #
+aws ecs register-task-definition \
+  --cli-input-json file:///tmp/$TASK_DEF_FAMILY.json
+
+20.
+# Define variables #
+CLUSTER_NAME=$(jq < cfn-output.json -r '.EcsClusterName');
+TASK_DEF_ARN=$(aws ecs list-task-definitions | \
+  jq -r ' .taskDefinitionArns[] | select( . | contains("crystal"))' | tail -1);
+# Update ecs service #
+aws ecs update-service \
+  --cluster $CLUSTER_NAME \
+  --service crystal-service-lb \
+  --task-definition "$(echo $TASK_DEF_ARN)"
+
+21.
+# Define variables #
+CLUSTER_NAME=$(jq < cfn-output.json -r '.EcsClusterName');
+TASK_DEF_ARN=$(aws ecs list-task-definitions | \
+  jq -r ' .taskDefinitionArns[] | select( . | contains("crystal"))' | tail -1);
+# Get task state #
+_list_tasks() {
+  aws ecs list-tasks \
+    --cluster $CLUSTER_NAME \
+    --service crystal-service-lb | \
+  jq -r ' .taskArns | @text' | \
+    while read taskArns; do 
+      aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $taskArns;
+    done | \
+  jq -r --arg TASK_DEF_ARN $TASK_DEF_ARN \
+    ' [.tasks[] | select( (.taskDefinitionArn == $TASK_DEF_ARN) 
+                    and (.lastStatus == "RUNNING" ))] | length'
+}
+until [ $(_list_tasks) == "3" ]; do
+  echo "Tasks are starting ..."
+  sleep 10s
+done && echo "Tasks started"
+
+22.
+AUTO_SCALING_GROUP=$(jq < cfn-output.json -r '.RubyAutoScalingGroupName');
+TARGET_EC2=$(aws ec2 describe-instances \
+    --filters Name=tag:aws:autoscaling:groupName,Values=$AUTO_SCALING_GROUP | \
+  jq -r ' .Reservations | first | .Instances | first | .InstanceId')
+aws ssm start-session --target $TARGET_EC2
+
+23.
+TARGET_IP=$(dig +short crystal.appmeshworkshop.hosted.local | head -1)
+curl -v $TARGET_IP:3000/crystal
+
+24.
+# Define variables #
+VPC_ID=$(jq < cfn-output.json -r '.VpcId');
+# Create cloud map namespace #
+OPERATION_ID=$(aws servicediscovery create-private-dns-namespace \
+    --name appmeshworkshop.pvt.local \
+    --description 'App Mesh Workshop private DNS namespace' \
+    --vpc $VPC_ID | \
+  jq -r ' .OperationId ')
+_operation_status() {
+  aws servicediscovery get-operation \
+    --operation-id $OPERATION_ID | \
+  jq -r '.Operation.Status '
+}
+until [ $(_operation_status) != "PENDING" ]; do
+  echo "Namespace is creating ..."
+  sleep 10s
+  if [ $(_operation_status) == "SUCCESS" ]; then
+    echo "Namespace created"
+    break
+  fi
+done
+
+25.
+# Define variables #
+NAMESPACE=$(aws servicediscovery list-namespaces | \
+  jq -r ' .Namespaces[] |
+    select ( .Properties.HttpProperties.HttpName == "appmeshworkshop.pvt.local" ) | .Id ');
+# Create cloud map service #
+aws servicediscovery create-service \
+  --name crystal \
+  --description 'Discovery service for the Crystal service' \
+  --namespace-id $NAMESPACE \
+  --dns-config 'RoutingPolicy=MULTIVALUE,DnsRecords=[{Type=A,TTL=300}]' \
+  --health-check-custom-config FailureThreshold=1
+
+26.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "serviceDiscovery": {
+      "awsCloudMap": {
+        "namespaceName": "appmeshworkshop.pvt.local",
+        "serviceName": "crystal",
+        "attributes": [
+          {
+            "key": "ECS_TASK_SET_EXTERNAL_ID",
+            "value": "vanilla-task-set"
+          }
+        ]
+      }
+    },
+    "logging": {
+      "accessLog": {
+        "file": {
+          "path": "/dev/stdout"
+        }
+      }
+    },      
+    "listeners": [
+      {
+        "healthCheck": {
+          "healthyThreshold": 3,
+          "intervalMillis": 10000,
+          "path": "/health",
+          "port": 3000,
+          "protocol": "http",
+          "timeoutMillis": 5000,
+          "unhealthyThreshold": 3
+        },
+        "portMapping": { "port": 3000, "protocol": "http" }
+      }
+    ]
+  }
+EOF
+); \
+# Create app mesh virtual node #
+aws appmesh create-virtual-node \
+  --mesh-name appmesh-workshop \
+  --virtual-node-name crystal-sd-vanilla \
+  --spec "$SPEC"
+
+
+27.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "listeners": [
+      {
+        "portMapping": { "port": 3000, "protocol": "http" }
+      }
+    ]
+  }
+EOF
+); \
+# Create app mesh virtual router #
+aws appmesh create-virtual-router \
+  --mesh-name appmesh-workshop \
+  --virtual-router-name crystal-router \
+  --spec "$SPEC"
+
+28.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "httpRoute": {
+      "action": { 
+        "weightedTargets": [
+          {
+            "virtualNode": "crystal-lb-vanilla",
+            "weight": 1
+          },
+          {
+            "virtualNode": "crystal-sd-vanilla",
+            "weight": 0
+          }
+        ]
+      },
+      "match": {
+        "prefix": "/"
+      }
+    },
+    "priority": 10
+  }
+EOF
+); \
+# Create app mesh route #
+aws appmesh create-route \
+  --mesh-name appmesh-workshop \
+  --virtual-router-name crystal-router \
+  --route-name crystal-traffic-route \
+  --spec "$SPEC"
+
+29.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "provider": {
+      "virtualRouter": { 
+        "virtualRouterName": "crystal-router"
+      }
+    }
+  }
+EOF
+); \
+# Create app mesh virtual service #
+aws appmesh update-virtual-service \
+  --mesh-name appmesh-workshop \
+  --virtual-service-name crystal.appmeshworkshop.hosted.local \
+  --spec "$SPEC"
+
+30.
+# Define variables #
+TASK_DEF_ARN=$(aws ecs list-task-definitions | \
+  jq -r ' .taskDefinitionArns[] | select( . | contains("crystal"))' | tail -1)
+TASK_DEF_OLD=$(aws ecs describe-task-definition --task-definition $TASK_DEF_ARN);
+TASK_DEF_NEW=$(echo $TASK_DEF_OLD \
+  | jq ' .taskDefinition' \
+  | jq ' .containerDefinitions[].environment |= map(
+        if .name=="APPMESH_VIRTUAL_NODE_NAME" then 
+              .value="mesh/appmesh-workshop/virtualNode/crystal-sd-vanilla" 
+        else . end) ' \
+  | jq ' del(.status, .compatibilities, .taskDefinitionArn, .requiresAttributes, .revision, .registeredBy, .registeredAt) '
+); \
+TASK_DEF_FAMILY=$(echo $TASK_DEF_ARN | cut -d"/" -f2 | cut -d":" -f1);
+echo $TASK_DEF_NEW > /tmp/$TASK_DEF_FAMILY.json && 
+# Register ecs task definition #
+aws ecs register-task-definition \
+  --cli-input-json file:///tmp/$TASK_DEF_FAMILY.json
+
+31.
+# Define variables #
+CLUSTER_NAME=$(jq < cfn-output.json -r '.EcsClusterName');
+# Create ecs service #
+aws ecs create-service \
+  --cluster $CLUSTER_NAME \
+  --service-name crystal-service-sd \
+  --desired-count 6 \
+  --deployment-controller type=EXTERNAL
+
+32.
+# Define variables #
+CLUSTER_NAME=$(jq < cfn-output.json -r '.EcsClusterName');
+SERVICE_ARN=$(aws ecs list-services --cluster $CLUSTER_NAME | \
+  jq -r ' .serviceArns[] | select( . | contains("sd"))' | tail -1)
+TASK_DEF_ARN=$(aws ecs list-task-definitions | \
+  jq -r ' .taskDefinitionArns[] | select( . | contains("crystal"))' | tail -1)
+SUBNET_ONE=$(jq < cfn-output.json -r '.PrivateSubnetOne');
+SUBNET_TWO=$(jq < cfn-output.json -r '.PrivateSubnetTwo');
+SUBNET_THREE=$(jq < cfn-output.json -r '.PrivateSubnetThree');
+SECURITY_GROUP=$(jq < cfn-output.json -r '.ContainerSecurityGroup');
+CMAP_SVC_ARN=$(aws servicediscovery list-services | \
+  jq -r '.Services[] | select(.Name == "crystal") | .Arn');
+# Create ecs task set #
+aws ecs create-task-set \
+  --service $SERVICE_ARN \
+  --cluster $CLUSTER_NAME \
+  --external-id vanilla-task-set \
+  --task-definition "$(echo $TASK_DEF_ARN)" \
+  --service-registries "registryArn=$CMAP_SVC_ARN" \
+  --launch-type FARGATE \
+  --scale value=50,unit=PERCENT \
+  --network-configuration \
+      "awsvpcConfiguration={subnets=[$SUBNET_ONE,$SUBNET_TWO,$SUBNET_THREE],
+        securityGroups=[$SECURITY_GROUP],
+        assignPublicIp=DISABLED}"
+
+33.
+# Define variables #
+CLUSTER_NAME=$(jq < cfn-output.json -r '.EcsClusterName');
+TASK_DEF_ARN=$(aws ecs list-task-definitions | \
+  jq -r ' .taskDefinitionArns[] | select( . | contains("crystal"))' | tail -1);
+CMAP_SVC_ID=$(aws servicediscovery list-services | \
+  jq -r '.Services[] | select(.Name == "crystal") | .Id');
+# Get task state #
+_list_tasks() {
+  aws ecs list-tasks \
+    --cluster $CLUSTER_NAME \
+    --service crystal-service-sd | \
+  jq -r ' .taskArns | @text' | \
+    while read taskArns; do 
+      aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $taskArns;
+    done | \
+  jq -r --arg TASK_DEF_ARN $TASK_DEF_ARN \
+    ' [.tasks[] | select( (.taskDefinitionArn == $TASK_DEF_ARN) 
+                    and (.lastStatus == "RUNNING" ))] | length'
+}
+# Get instances health status #
+_list_instances() {
+  aws servicediscovery get-instances-health-status \
+    --service-id $CMAP_SVC_ID | \
+  jq ' [.Status | to_entries[] | select( .value == "HEALTHY")] | length'
+}
+until [ $(_list_tasks) == "3" ]; do
+  echo "Tasks are starting ..."
+  sleep 10s
+  if [ $(_list_tasks) == "3" ]; then
+    echo "Tasks started"
+    break
+  fi
+done
+sleep 10s
+until [ $(_list_instances) == "3" ]; do
+  echo "Instances are registering ..."
+  sleep 10s
+  if [ $(_list_instances) == "3" ]; then
+    echo "Instances registered"
+    break
+  fi
+done
+
+34.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "httpRoute": {
+      "action": { 
+        "weightedTargets": [
+          {
+            "virtualNode": "crystal-lb-vanilla",
+            "weight": 1
+          },
+          {
+            "virtualNode": "crystal-sd-vanilla",
+            "weight": 2
+          }
+        ]
+      },
+      "match": {
+        "prefix": "/"
+      }
+    },
+    "priority": 10
+  }
+EOF
+); \
+# Create app mesh route #
+aws appmesh update-route \
+  --mesh-name appmesh-workshop \
+  --virtual-router-name crystal-router \
+  --route-name crystal-traffic-route \
+  --spec "$SPEC"
+
+35.
+# Define variables #
+SPEC=$(cat <<-EOF
+  { 
+    "httpRoute": {
+      "action": { 
+        "weightedTargets": [
+          {
+            "virtualNode": "crystal-sd-vanilla",
+            "weight": 1
+          }
+        ]
+      },
+      "match": {
+        "prefix": "/"
+      }
+    },
+    "priority": 10
+  }
+EOF
+); \
+# Update app mesh route #
+aws appmesh update-route \
+  --mesh-name appmesh-workshop \
+  --virtual-router-name crystal-router \
+  --route-name crystal-traffic-route \
+  --spec "$SPEC"
+
+36.
+# Define variables
+CLUSTER_NAME=$(jq < cfn-output.json -r '.EcsClusterName');
+INTERNAL_LB_ARN=$(jq < cfn-output.json -r '.InternalLoadBalancerArn');
+# Delete ecs service
+aws ecs delete-service \
+  --cluster $CLUSTER_NAME \
+  --service crystal-service-lb \
+  --force
+# Delete load lalancer
+aws elbv2 delete-load-balancer \
+  --load-balancer-arn $INTERNAL_LB_ARN
+
+37.
+# Define variables
+HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
+    --dns-name appmeshworkshop.hosted.local \
+    --max-items 1 | \
+  jq -r ' .HostedZones | first | .Id');
+RECORD_SET=$(aws route53 list-resource-record-sets --hosted-zone-id=$HOSTED_ZONE_ID | \
+ jq -r '.ResourceRecordSets[] | select (.Name == "crystal.appmeshworkshop.hosted.local.")');
+cat <<-EOF > /tmp/update_r53.json
+{
+  "Comment": "UPDATE crystal.appmeshworkshop.hosted.local",
+  "Changes": [
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": $RECORD_SET
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "crystal.appmeshworkshop.hosted.local",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [
+          { "Value": "crystal.appmeshworkshop.pvt.local." }
+        ]
+      }
+    }
+  ]
+}
+EOF
+# Change route53 record set
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch file:///tmp/update_r53.json
