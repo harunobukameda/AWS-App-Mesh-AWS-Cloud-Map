@@ -59,7 +59,7 @@ git clone https://github.com/brentley/ecsdemo-crystal.git
 
 7.
 cd ~/environment
-curl -s https://raw.githubusercontent.com/brentley/appmeshworkshop/master/templates/appmesh-baseline.yml -o appmesh-baseline.yml
+curl -s https://raw.githubusercontent.com/aws-containers/appmeshworkshop/main/templates/appmesh-baseline.yml -o appmesh-baseline.yml
 
 8.
 # Define environment variable
